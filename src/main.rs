@@ -35,17 +35,18 @@ fn user_slice_id(cgroup: &CGroup) -> Option<String> {
 }
 
 fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(), std::io::Error> {
+    /* There may be system-level cgroups we need to activate higher in the hierarchy,
+     * so check these out before returning.
+     */
+    if let Some(mut parent) = cgroup.parent() {
+        propagate_dmem_activation(&mut parent, system);
+    }
+
     /* If we're operating on a system level, don't try messing with users' cgroups. This potentially
      * messes up permissions for the cgroup files so users can't set their own limits in child
      * cgroups.
      */
     if user_slice_id(&cgroup).is_some() && system {
-        /* There may be system-level cgroups we need to activate higher in the hierarchy,
-         * so check these out before returning.
-         */
-        if let Some(mut parent) = cgroup.parent() {
-            propagate_dmem_activation(&mut parent, system);
-        }
         return Ok(());
     }
 
