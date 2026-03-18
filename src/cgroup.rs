@@ -123,7 +123,9 @@ impl CGroup {
         }
 
         if let Err(e) = std::fs::write(file, contents) {
-            println!("WARNING: Could not write dmem limit file: {}!", e);
+            if e.kind() != std::io::ErrorKind::PermissionDenied {
+                println!("WARNING: Could not write dmem limit file: {}!", e);
+            }
         }
     }
 
