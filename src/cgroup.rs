@@ -2,14 +2,17 @@ use std::path::PathBuf;
 
 type DMemLimit = std::collections::HashMap<String, u64>;
 
-
 #[derive(Debug)]
 pub struct CGroup {
     path: PathBuf,
 }
 
 impl CGroup {
-    pub fn root() -> CGroup {CGroup { path: PathBuf::from("/sys/fs/cgroup") }}
+    pub fn root() -> CGroup {
+        CGroup {
+            path: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
 
     pub fn is_root(&self) -> bool {
         self.path == std::path::Path::new("/sys/fs/cgroup/")
@@ -18,9 +21,7 @@ impl CGroup {
     pub fn from_path(path: PathBuf) -> CGroup {
         assert!(path.starts_with("/sys/fs/cgroup/"));
 
-        CGroup {
-            path,
-        }
+        CGroup { path }
     }
 
     pub fn descendants(&self) -> Vec<CGroup> {
@@ -48,7 +49,7 @@ impl CGroup {
 
     pub fn name(&self) -> String {
         if self.is_root() {
-           String::from("")
+            String::from("")
         } else if let Some(name) = self.path.file_name() {
             name.to_string_lossy().to_string()
         } else {
@@ -73,7 +74,17 @@ impl CGroup {
     pub fn active_controllers(&self) -> Option<Vec<String>> {
         if let Ok(str) = std::fs::read_to_string(self.path.join("cgroup.subtree_control")) {
             let str = str.trim();
-            Some(str.split(' ').map(|x|x.to_string()).collect())
+            Some(
+                str.split(' ')
+                    .filter_map(|x| {
+                        if x.is_empty() {
+                            None
+                        } else {
+                            Some(x.to_string())
+                        }
+                    })
+                    .collect(),
+            )
         } else {
             None
         }
@@ -91,7 +102,10 @@ impl CGroup {
             for line in str.lines() {
                 let words: Vec<_> = line.split(' ').collect();
                 if words.len() != 2 {
-                    println!("WARNING: Unexpected number of words in dmem limit string: \"{}\"\n", line);
+                    println!(
+                        "WARNING: Unexpected number of words in dmem limit string: \"{}\"\n",
+                        line
+                    );
                     continue;
                 }
                 if words[1] == "max" {

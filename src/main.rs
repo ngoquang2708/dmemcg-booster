@@ -49,6 +49,24 @@ fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(),
         return Ok(());
     }
 
+    /* Don't try enabling the dmem controller in cgroups that are a) leaf cgroups or b) don't have
+     * any other controllers set. If a controller is enabled in cgroup.subtree_control, no more
+     * processes may be spawned in that cgroup. Enabling a controller ourselves could confuse
+     * systemd if it can't spawn new processes all of a sudden. If there are descendant cgroups, or
+     * another controller is active, enabling the dmem controller is risk-free since systemd
+     * wouldn't be able to spawn a new process anyway.
+     */
+    let can_activate_controller = !cgroup.descendants().is_empty() || {
+        if let Some(controllers) = cgroup.active_controllers() {
+            !controllers.is_empty()
+        } else {
+            false
+        }
+    };
+    if !can_activate_controller {
+        return Ok(());
+    }
+
     let mut retry = false;
     loop {
         if let Err(e) = cgroup.add_controller("dmem") {
@@ -80,6 +98,7 @@ fn propagate_dmem_activation(cgroup: &mut CGroup, system: bool) {
             return;
         }
     };
+
     if !has_active_dmem {
         if let Err(_) = try_activate_dmem_controller(cgroup, system) {
             return;
@@ -143,8 +162,6 @@ fn handle_new_unit(connection: &Connection, unit_path: String, system: bool) {
         "org.freedesktop.systemd1.Scope",
         "org.freedesktop.systemd1.Slice",
         "org.freedesktop.systemd1.Socket",
-        "org.freedesktop.systemd1.Mount",
-        "org.freedesktop.systemd1.Swap",
     ];
     for iface_name in iface_names.iter() {
         let get_cgroup_proxy = connection.with_proxy(
