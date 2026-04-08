@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "dmemcg-booster"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "dbus",
 ]
