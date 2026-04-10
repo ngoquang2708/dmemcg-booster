@@ -9,29 +9,18 @@ use dbus::blocking::Connection;
 mod cgroup;
 
 fn user_slice_id(cgroup: &CGroup) -> Option<String> {
-    let parent = cgroup.parent();
-    if let None = parent {
-        return None;
-    }
-
-    let mut parent = parent.unwrap();
+    let mut parent = cgroup.parent()?;
     loop {
         let name = parent.name();
-        if name.starts_with("user-")
-            && name.ends_with(".slice")
-            && let Ok(_) = u32::from_str(&name[5..name.len() - 6])
-        {
-            return Some(String::from(&name[5..name.len() - 6]));
+        if !name.starts_with("user-") || !name.ends_with(".slice") {
+            return None;
         }
-
-        if let Some(grandparent) = parent.parent() {
-            parent = grandparent;
-        } else {
-            break;
+        let id = name.get(5..name.len() - 6)?;
+        if u32::from_str(id).is_ok() {
+            return Some(id.to_owned());
         }
+        parent = parent.parent()?;
     }
-
-    None
 }
 
 fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(), std::io::Error> {
@@ -46,7 +35,7 @@ fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(),
      * messes up permissions for the cgroup files so users can't set their own limits in child
      * cgroups.
      */
-    if user_slice_id(&cgroup).is_some() && system {
+    if user_slice_id(cgroup).is_some() && system {
         return Ok(());
     }
 
@@ -70,7 +59,7 @@ fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(),
 
     let mut retry = false;
     loop {
-        if let Err(e) = cgroup.add_controller("dmem") {
+        return if let Err(e) = cgroup.add_controller("dmem") {
             /* NotFound means the grandparent doesn't have the controller either,
              * so try enabling controllers further up the hierarchy and retry.
              * It's possible that the dmem controller is missing on cgroups we don't have
@@ -84,10 +73,10 @@ fn try_activate_dmem_controller(cgroup: &mut CGroup, system: bool) -> Result<(),
                 retry = true;
                 continue;
             }
-            return Err(e);
+            Err(e)
         } else {
-            return Ok(());
-        }
+            Ok(())
+        };
     }
 }
 
@@ -100,10 +89,8 @@ fn propagate_dmem_activation(cgroup: &mut CGroup, system: bool) {
         }
     };
 
-    if !has_active_dmem {
-        if let Err(_) = try_activate_dmem_controller(cgroup, system) {
-            return;
-        }
+    if !has_active_dmem && try_activate_dmem_controller(cgroup, system).is_err() {
+        return;
     }
 
     let should_set_limit = {
@@ -113,14 +100,14 @@ fn propagate_dmem_activation(cgroup: &mut CGroup, system: bool) {
          * user@<id>.service, which is owned by the user, but the parent user-<id>.slice is owned by
          * root), because those are still owned by root and users can't set them.
          */
-        if let Some(parent) = cgroup.parent() && let Some(user_id) = user_slice_id(&parent) {
+        if let Some(parent) = cgroup.parent()
+            && let Some(user_id) = user_slice_id(&parent)
+        {
             if system {
                 return;
             }
             let name = cgroup.name();
-            let mut user_service_name = String::from("user@");
-            user_service_name.push_str(user_id.as_str());
-            user_service_name.push_str(".service");
+            let user_service_name = format!("user@{user_id}.service");
 
             /* At the user level, the only cgroups that should receive protection are app.slice
              * (where foreground apps live) and the user@<id>.service unit, which contains
@@ -136,11 +123,10 @@ fn propagate_dmem_activation(cgroup: &mut CGroup, system: bool) {
         return;
     }
 
-    let limits = CGroup::root().device_memory_capacity();
-    if let None = limits {
+    let Some(limits) = CGroup::root().device_memory_capacity() else {
         return;
-    }
-    cgroup.write_device_memory_low(&limits.unwrap());
+    };
+    cgroup.write_device_memory_low(&limits);
 }
 
 fn activate_dmem_in_descendants(cgroup: &mut CGroup, system: bool) {
@@ -155,6 +141,8 @@ fn activate_dmem_in_descendants(cgroup: &mut CGroup, system: bool) {
 }
 
 fn handle_new_unit(connection: &Connection, unit_path: String, system: bool) {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+
     let mut cgroup: Option<String> = None;
 
     /* All interfaces that have the ControlGroup property */
@@ -164,30 +152,26 @@ fn handle_new_unit(connection: &Connection, unit_path: String, system: bool) {
         "org.freedesktop.systemd1.Slice",
         "org.freedesktop.systemd1.Socket",
     ];
-    for iface_name in iface_names.iter() {
-        let get_cgroup_proxy = connection.with_proxy(
-            "org.freedesktop.systemd1",
-            unit_path.as_str(),
-            Duration::from_secs(1),
-        );
-        let res: Result<(dbus::arg::Variant<String>,), dbus::Error> = get_cgroup_proxy.method_call(
+    for iface_name in iface_names {
+        let get_cgroup_proxy =
+            connection.with_proxy("org.freedesktop.systemd1", &unit_path, TIMEOUT);
+        let res: Result<(dbus::arg::Variant<String>,), _> = get_cgroup_proxy.method_call(
             "org.freedesktop.DBus.Properties",
             "Get",
             (iface_name, "ControlGroup"),
         );
-
         if let Ok((candidate_cgroup,)) = res {
             cgroup = Some(candidate_cgroup.0);
             break;
         }
     }
+    let Some(cgroup) = cgroup else {
+        return;
+    };
+    let cgroup = format!("/sys/fs/cgroup/{cgroup}");
+    let mut cgroup = CGroup::from_path(cgroup.into());
 
-    if let Some(cgroup_path) = cgroup {
-        let mut cgroup = String::from("/sys/fs/cgroup");
-        cgroup.push_str(cgroup_path.as_str());
-        let mut cgroup = CGroup::from_path(std::path::PathBuf::from(cgroup));
-        propagate_dmem_activation(&mut cgroup, system);
-    }
+    propagate_dmem_activation(&mut cgroup, system);
 }
 
 fn main() {
@@ -240,10 +224,7 @@ fn main() {
     activate_dmem_in_descendants(&mut CGroup::root(), system);
 
     loop {
-        while connection
-            .process(Duration::from_millis(1000))
-            .unwrap()
-        {}
+        while connection.process(Duration::from_millis(1000)).unwrap() {}
         let mut queue = unit_queue.lock().expect("Failed to retrieve unit queue!");
         for unit in queue.iter() {
             handle_new_unit(&connection, unit.to_string(), system);

@@ -1,6 +1,10 @@
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 type DMemLimit = std::collections::HashMap<String, u64>;
+
+const CG_ROOT: &str = "/sys/fs/cgroup";
 
 #[derive(Debug)]
 pub struct CGroup {
@@ -10,41 +14,28 @@ pub struct CGroup {
 impl CGroup {
     pub fn root() -> CGroup {
         CGroup {
-            path: PathBuf::from("/sys/fs/cgroup"),
+            path: PathBuf::from(CG_ROOT),
         }
     }
 
     pub fn is_root(&self) -> bool {
-        self.path == std::path::Path::new("/sys/fs/cgroup/")
+        &self.path == CG_ROOT
     }
 
     pub fn from_path(path: PathBuf) -> CGroup {
-        assert!(path.starts_with("/sys/fs/cgroup/"));
+        assert!(path.starts_with(CG_ROOT));
 
         CGroup { path }
     }
 
     pub fn descendants(&self) -> Vec<CGroup> {
-        let mut descs: Vec<CGroup> = Vec::new();
-
-        let dir = std::fs::read_dir(&self.path);
-        if let Ok(dir) = dir {
-            for entry in dir {
-                if entry.is_err() {
-                    continue;
-                }
-                let entry = entry.unwrap();
-                let file_type = entry.file_type();
-
-                if file_type.is_err() || !file_type.unwrap().is_dir() {
-                    continue;
-                }
-
-                descs.push(CGroup::from_path(entry.path()));
-            }
-        }
-
-        descs
+        let Ok(dir) = fs::read_dir(&self.path) else {
+            return Default::default();
+        };
+        dir.filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|it| !it.is_dir()).unwrap_or_default())
+            .map(|e| CGroup::from_path(e.path()))
+            .collect()
     }
 
     pub fn name(&self) -> String {
@@ -61,92 +52,72 @@ impl CGroup {
         if self.is_root() {
             return None;
         }
-
-        let parent = self.path.parent();
-
-        if let None = parent {
-            return None;
-        }
-
-        Some(CGroup::from_path(parent?.to_path_buf()))
+        self.path
+            .parent()
+            .map(ToOwned::to_owned)
+            .map(CGroup::from_path)
     }
 
     pub fn active_controllers(&self) -> Option<Vec<String>> {
-        if let Ok(str) = std::fs::read_to_string(self.path.join("cgroup.subtree_control")) {
-            let str = str.trim();
-            Some(
-                str.split(' ')
-                    .filter_map(|x| {
-                        if x.is_empty() {
-                            None
-                        } else {
-                            Some(x.to_string())
-                        }
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        }
+        fs::read_to_string(self.path.join("cgroup.subtree_control"))
+            .ok()?
+            .split_ascii_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+            .into()
     }
 
-    pub fn add_controller(&mut self, controller: &str) -> Result<(), std::io::Error> {
-        let mut control = String::from("+");
-        control.push_str(controller);
-        std::fs::write(self.path.join("cgroup.subtree_control"), control)
+    pub fn add_controller(&mut self, controller: &str) -> io::Result<()> {
+        let control = format!("+{controller}");
+        fs::write(self.path.join("cgroup.subtree_control"), control)
     }
 
-    fn parse_limits_file<P: AsRef<std::path::Path>>(file: P) -> Option<DMemLimit> {
-        if let Ok(str) = std::fs::read_to_string(file) {
-            let mut limit = DMemLimit::new();
-            for line in str.lines() {
+    fn parse_limits_file(file: &Path) -> Option<DMemLimit> {
+        fn parse_line(line: &str) -> Option<(String, u64)> {
+            let (name, value) = {
                 let words: Vec<_> = line.split(' ').collect();
                 if words.len() != 2 {
-                    println!(
-                        "WARNING: Unexpected number of words in dmem limit string: \"{}\"\n",
-                        line
-                    );
-                    continue;
+                    return None;
                 }
-                if words[1] == "max" {
-                    limit.insert(words[0].to_string(), u64::max_value());
-                } else if let Ok(val) = u64::from_str_radix(words[1], 10) {
-                    limit.insert(words[0].to_string(), val);
-                } else {
-                    println!("WARNING: Could not parse dmem limit number: \"{}\"\n", line);
-                }
-            }
-            Some(limit)
-        } else {
-            None
+                (words[0], words[1])
+            };
+            let value = if value == "max" {
+                u64::MAX
+            } else {
+                value.parse().ok()?
+            };
+            Some((name.to_owned(), value))
         }
+
+        let mut limits = DMemLimit::new();
+        for line in fs::read_to_string(file).ok()?.lines() {
+            let Some((name, value)) = parse_line(line) else {
+                eprintln!("WARNING: Unexpected number of words in dmem limit string: \"{line}\"");
+                continue;
+            };
+            limits.insert(name, value);
+        }
+        Some(limits)
     }
 
-    fn write_limits_file<P: AsRef<std::path::Path>>(&self, file: P, limit: &DMemLimit) {
+    fn write_limits_file(&self, file: &Path, limit: &DMemLimit) {
         let mut contents = String::new();
-
-        for entry in limit {
-            contents.push_str(entry.0.as_str());
-            contents.push_str(" ");
-            if *entry.1 == u64::max_value() {
-                contents.push_str("max");
-            } else {
-                contents.push_str(entry.1.to_string().as_str());
+        for (name, value) in limit {
+            if *value == u64::MAX {
+                let _ = writeln!(&mut contents, "{name} max");
+                continue;
             }
-            contents.push('\n');
+            let _ = writeln!(&mut contents, "{name} {value}");
         }
-
-        if let Err(e) = std::fs::write(file, contents) {
-            if e.kind() != std::io::ErrorKind::PermissionDenied {
-                println!("WARNING: Could not write dmem limit file: {}!", e);
-            }
+        if let Err(e) = fs::write(file, contents)
+            && e.kind() != io::ErrorKind::PermissionDenied
+        {
+            eprintln!("WARNING: Could not write dmem limit file: {e}!");
         }
     }
 
     fn limit_from_attribute(&self, attrib_name: &str) -> Option<DMemLimit> {
-        let mut file: PathBuf = self.path.clone();
-        file.push(attrib_name);
-        Self::parse_limits_file(file)
+        Self::parse_limits_file(&self.path.join(attrib_name))
     }
 
     pub fn device_memory_capacity(&self) -> Option<DMemLimit> {
@@ -154,8 +125,6 @@ impl CGroup {
     }
 
     pub fn write_device_memory_low(&mut self, limit: &DMemLimit) {
-        let mut file: PathBuf = self.path.clone();
-        file.push("dmem.low");
-        self.write_limits_file(file, limit);
+        self.write_limits_file(&self.path.join("dmem.low"), limit);
     }
 }
